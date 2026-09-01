@@ -1,0 +1,109 @@
+# Portainer stack: Jellyfin.
+#
+# Deploy as a git-repository stack with compose path:
+#   media-stack/docker-compose.media.yml
+#
+# Deliberately a SEPARATE Portainer stack from docker-compose.vpn.yml. The
+# VPN stack's members share a lifecycle (they all live in `vpn`'s network
+# namespace); Jellyfin's does not, and must not — Jellyfin serves LAN
+# clients and must stay reachable while the tunnel cycles or redeploys. See
+# README.md "Architecture" for the full reasoning.
+#
+# Jellyfin stays OUTSIDE the PIA tunnel, deliberately: it has no privacy-
+# sensitive egress (artwork/metadata lookups only), and tunnelling video
+# streams back to the same LAN would be pure overhead. Assert Jellyfin's
+# egress IP is the untunnelled one as part of your test pass, precisely so
+# this stays a deliberate choice rather than something that quietly drifts
+# the other way.
+#
+# Digest pinning: linuxserver.io publishes no per-version tags, only
+# floating `latest`. The digest below is the manifest-LIST digest for that
+# tag, resolved 2026-08-22 via lscr.io's ghcr.io-backed registry API and
+# confirmed to include a linux/amd64 entry.
+# Re-resolve and bump deliberately -- see docker-compose.vpn.yml's header
+# for the full rationale, which applies identically here.
+#
+# Required stack environment variables:
+#   MEDIA_ROOT   same host directory as docker-compose.vpn.yml's MEDIA_ROOT
+#                -- must be the SAME value, or Jellyfin reads a different
+#                tree from the one the *arrs write to.
+# Optional:
+#   TZ           IANA timezone (default Etc/UTC)
+#
+# Host-side prerequisite: the render group's gid, for hardware transcoding.
+# It differs between distributions and hosts, so it is a variable, not a
+# constant:  getent group render | cut -d: -f3
+#
+# A STANDING RULE worth copying even if you take nothing else from this
+# file: do not add a bind mount here for any encrypted or otherwise
+# sensitive mountpoint on the host. A media server is exactly the kind of
+# container that accumulates "just one more library path" over time, and a
+# bind mount of a decrypted volume reads it in the clear without anyone
+# ever deciding that it should. Make it an explicit test that the mount
+# list has not grown, rather than a thing you remember.
+
+services:
+  jellyfin:
+    # lscr.io/linuxserver/jellyfin, tag `latest`. Digest resolved
+    # 2026-08-22 (linux/amd64 present in the manifest list).
+    image: lscr.io/linuxserver/jellyfin@sha256:aef1046ab41bbd7b48e205e711aa31dfb1fa55a3fb8e22cbbb150a323c4a48c7
+    container_name: jellyfin
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/dri/renderD128        # VAAPI hardware transcode
+    group_add:
+      # Host `render` gid -- differs per host/distro:
+      #   getent group render | cut -d: -f3
+      - "${RENDER_GID:?host render group gid -- see .env.example}"
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ:-Etc/UTC}
+    ports:                         # bound to the host's LAN address, never
+                                    # bare 0.0.0.0
+      - "${LAN_IP:?host LAN address to publish on}:8096:8096"
+    networks:
+      # Mapping form, not a list: media-jf-link needs a per-network key
+      # (ipv4_address) and YAML forbids mixing `- item` with `key:` in one
+      # block. `default: {}` is the mapping-form equivalent of listing it.
+      #
+      # `default` MUST stay listed -- naming any network opts this service
+      # out of the implicit default, and Jellyfin needs ordinary internet
+      # egress for artwork/metadata lookups, untunnelled and deliberately
+      # so.
+      default: {}
+      media-jf-link:
+        # PINNED, and the *arrs must be pointed at this literal address --
+        # NOT at `http://jellyfin:8096`. Service-name DNS does not work from
+        # the vpn netns: wg-quick rewrites /etc/resolv.conf to the VPN's
+        # own resolvers, which is an anti-DNS-leak property worth keeping
+        # rather than a bug to work around. Nothing in
+        # that namespace ever queries Docker's embedded DNS at 127.0.0.11,
+        # so a service name would simply never resolve. Verified before
+        # deploy: `getent hosts jellyfin` from inside the netns -> FAILED.
+        ipv4_address: 10.89.0.10
+    volumes:
+      - jellyfin-config:/config
+      # Read-only: Jellyfin never needs to write the library, the *arrs own
+      # it. Bind the single common parent, not the leaf directories, so
+      # hardlinks between downloads and library stay possible.
+      - ${MEDIA_ROOT:?media parent directory on the host -- see .env.example}/library:/data/library:ro
+      # Existing pre-stack media can be added here as further read-only
+      # binds without moving anything, e.g.:
+      #   - /srv/old-media/Video:/data/video-legacy:ro
+
+networks:
+  # See docker-compose.vpn.yml's identical block for the full rationale.
+  # External + created by install-on-host.sh because this network spans two
+  # Portainer stacks; `internal: true` at creation is what makes it
+  # structurally incapable of carrying egress.
+  media-jf-link:
+    external: true
+
+volumes:
+  # Named volume under /var/lib/docker -- not on MEDIA_ROOT, not covered by
+  # any backup job by default. Losing it costs a Jellyfin
+  # reconfiguration (libraries, users, watch state), not media data.
+  jellyfin-config:

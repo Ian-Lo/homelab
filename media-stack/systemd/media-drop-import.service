@@ -1,0 +1,28 @@
+[Unit]
+Description=media-stack: trigger Sonarr/Radarr import of manually dropped files
+Documentation=file:///opt/media-stack/drop-import.sh
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/media-stack/drop-import.sh
+# Root: only to read the API key files (/etc/media-stack/*, root:root 400,
+# installed by install-on-host.sh -- same custody model as the netns-guard
+# webhook URL). The script itself touches no Docker socket and no media
+# files; it POSTs two fixed URLs and the *arrs do the file work as uid
+# 1000 inside their containers.
+User=root
+
+# The skipped-set state lives here (drop-import.<app>.skipped), so an
+# unresolved file is not re-listed in the journal every 5 minutes forever.
+# RuntimeDirectoryPreserve=yes is LOAD-BEARING, not decoration: this unit is
+# Type=oneshot, so it stops after every run, and systemd removes a
+# RuntimeDirectory= on stop unless told otherwise. Without the preserve line
+# the digest is wiped every tick and it silently reverts to the exact spam it
+# was written to prevent -- while looking like the dedup logic is broken.
+RuntimeDirectory=media-stack
+RuntimeDirectoryPreserve=yes
+
+# Installed by install-on-host.sh to /etc/systemd/system/ -- the copy in
+# this repo is the source of truth; edit here and re-run install-on-host.sh
+# to push a change, don't hand-edit the installed copy.

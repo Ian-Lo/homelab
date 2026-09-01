@@ -1,0 +1,97 @@
+# Hermes Agent (NousResearch, https://github.com/NousResearch/hermes-agent)
+# backed by the Anthropic Claude API — no local LLM.
+#
+# Deploy with `docker compose up -d`, or as a Portainer git-repository stack
+# with compose path `hermes-agent/docker-compose.yml`.
+#
+# Note if you use Portainer: this file sets cap_add/cap_drop, and Portainer's
+# non-administrator restrictions test for the PRESENCE of those directives,
+# not whether they grant or remove privilege. Hardening this compose file is
+# therefore also what makes the stack admin-only to redeploy. The portainer/
+# README in this repo explains that behaviour; the trade-off is real and
+# worth deciding on deliberately rather than discovering it during an outage.
+#
+# Design and full rationale: README.md. Summary of what's non-default and why:
+#
+#   init: true + cap_drop: ALL + a minimal cap_add — the image's s6-overlay
+#   stage2 hook needs to run one root-phase usermod/groupmod/chown before it
+#   drops the supervised gateway process to HERMES_UID/HERMES_GID. Confirmed
+#   against the image's own Dockerfile and docker/stage2-hook.sh, not
+#   assumed — see README.md "Why HERMES_UID/HERMES_GID, not user:".
+#
+#   127.0.0.1:8642:8642 — loopback only, and that publish binding IS the
+#   access control. Reach it over an SSH tunnel (tunnel.sh does this):
+#     ssh -N -L 8642:127.0.0.1:8642 <user>@<host>
+#   Do not assume a host firewall is backstopping this.
+#
+#   Fixed hermes-net subnet (172.30.0.0/24) — an agent's tool calls are
+#   steerable by whatever content it processes, so container->LAN and
+#   container->host reach both need to be closed deliberately rather than
+#   left default-open. The subnet is pinned so that a DOCKER-USER drop rule
+#   written against it keeps matching; on a default-created network it is a
+#   lease that merely happens to be stable. README.md "Egress containment"
+#   has the two-paths-two-controls argument.
+#
+# Required environment variable (set in the stack env or a .env alongside
+# this file, NEVER in this file or in git):
+#   HERMES_API_KEY   random secret for the gateway's own API auth, e.g.
+#                     `openssl rand -hex 16` (32 chars minimum).
+#
+# No model credential here. Authenticate the container after first start,
+# either with a provider API key or the interactive OAuth flow
+# (`docker exec -it hermes-agent hermes setup --portal`); auth.json persists
+# in the /opt/data bind mount. README.md "Secrets" argues for a dedicated,
+# revocable key over a personal account session, and why that choice
+# interacts with the egress rules above.
+
+services:
+  hermes-agent:
+    image: nousresearch/hermes-agent:v2026.8.27@sha256:e0df6adebddf29b91112aefc999d4aaf6846c9eb544faca5672a16a13590ff79
+    container_name: hermes-agent
+    restart: unless-stopped
+    command: gateway run
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # Minimal set for the root-phase usermod/groupmod/chown + s6-setuidgid
+      # drop. Confirm against your image version and trim anything unused.
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    pids_limit: 512
+    # read_only: true was tried and dropped — s6-overlay's stage2 hook must
+    # write /etc/passwd,/etc/group,/etc/shadow to usermod/groupmod the
+    # baked hermes account to HERMES_UID/HERMES_GID (10000 != 1000, so the
+    # remap always triggers), and s6-overlay v3 needs a writable, EXEC-able
+    # /run to launch its own service scripts. Both are structural, not
+    # rollout uncertainty. cap_drop+no-new-privileges+non-root+pids_limit
+    # remain the controls instead. See README.md.
+    environment:
+      HERMES_UID: 1000
+      HERMES_GID: 1000
+      TZ: ${TZ:-Etc/UTC}
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_KEY: ${HERMES_API_KEY:?set in the stack/.env — openssl rand -hex 16}
+      # No model credential is set here on purpose — it is supplied once,
+      # after first start, and persists in the /opt/data bind mount. See
+      # README.md "Secrets".
+    ports:
+      - "127.0.0.1:8642:8642"
+    volumes:
+      - /opt/hermes-agent/data:/opt/data
+    networks:
+      hermes-net: {}
+    mem_limit: 4g
+    cpus: 2.0
+
+networks:
+  hermes-net:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

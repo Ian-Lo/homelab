@@ -1,0 +1,13 @@
+.DS_Store
+.claude/
+.obsidian/
+
+# Real values for the parameterised stacks — only .env.example is tracked.
+.env
+*.env
+!.env.example
+
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

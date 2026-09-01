@@ -1,0 +1,30 @@
+[Unit]
+Description=media-stack: insert DOCKER-USER LAN-only DROP rules for published WebUI ports
+Documentation=file:///opt/media-stack/docker-user-rules.sh
+# After docker.service so the DOCKER-USER chain already exists when this
+# runs (Docker creates it at daemon start and never flushes it). Wants, not
+# Requires: if docker were down the script still inserts rules into a chain
+# it creates itself, which Docker then adopts.
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/media-stack/docker-user-rules.sh
+# Root: iptables needs it. The script is root:root 755 on the host and
+# never mounted into any container (same reasoning as netns-guard.sh).
+User=root
+RemainAfterExit=yes
+
+# Installed by install-on-host.sh to /etc/systemd/system/ -- the copy in
+# this repo is the source of truth; edit here and re-run install-on-host.sh
+# to push a change, don't hand-edit the installed copy.
+#
+# This unit exists because the rules must survive a reboot WITHOUT
+# iptables-persistent: that package declares Conflicts: ufw, so installing
+# it removes ufw and takes the host's INPUT rules with it, silently. A
+# boot-time re-insert has no package to conflict with and no saved snapshot
+# to go stale. See DESIGN.md.
+
+[Install]
+WantedBy=multi-user.target

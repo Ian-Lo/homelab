@@ -1,0 +1,14 @@
+[Unit]
+Description=Run media-drop-import.service on a timer
+
+[Timer]
+# 5 minutes: fast enough that a drop feels handled without watching a UI,
+# slow enough to be negligible load (the service exits instantly when the
+# drop folders are empty). Persistent=false deliberately -- a missed tick
+# is irrelevant, the next one scans the same folders.
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

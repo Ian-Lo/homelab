@@ -1,0 +1,71 @@
+name: Executable scripts convention
+
+# Enforces two house rules for every tracked *.sh file, so a script that's
+# only ever been run via `bash script.sh` doesn't quietly go non-executable
+# and break the day someone (or systemd, or install-on-host.sh) invokes it
+# directly as `./script.sh` — see media-stack/scripts/docker-user-rules.sh,
+# which was 644 from its first commit and only surfaced when run by hand.
+#
+#   1. Every *.sh must carry the executable bit, UNLESS it's meant to be
+#      sourced rather than executed (exempted below by path/name pattern —
+#      none exist today, but the exemption is here so a future sourced-only
+#      file doesn't get force-flagged).
+#   2. Every executable *.sh must start with a `#!` shebang on line 1 — an
+#      executable script with no shebang silently falls back to /bin/sh,
+#      its own quiet footgun.
+#
+# Read-only: parses `git ls-files -s` and file contents, executes nothing
+# from the repo. No secrets, no runtime access.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check *.sh executable bit and shebang
+        run: |
+          set -euo pipefail
+          fail=0
+
+          # Sourced-only exemption: files under any lib/ directory, or
+          # named *.lib.sh. No such files exist today — this just keeps a
+          # future one from being force-flagged into +x.
+          is_exempt() {
+            case "$1" in
+              */lib/*|*.lib.sh) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          while IFS=$'\t' read -r mode _hash _stage path; do
+            case "$path" in
+              *.sh) ;;
+              *) continue ;;
+            esac
+
+            if is_exempt "$path"; then
+              continue
+            fi
+
+            if [ "$mode" != "100755" ]; then
+              echo "::error file=$path::tracked as mode $mode, expected 100755 (executable) — chmod +x and re-commit, or exempt it under lib/ or *.lib.sh if it's meant to be sourced, not executed"
+              fail=1
+              continue
+            fi
+
+            first_two=$(head -c 2 -- "$path")
+            if [ "$first_two" != "#!" ]; then
+              echo "::error file=$path::executable but missing a #! shebang on line 1"
+              fail=1
+            fi
+          done < <(git ls-files -s -- '*.sh')
+
+          exit "$fail"

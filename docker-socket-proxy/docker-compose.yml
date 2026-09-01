@@ -1,0 +1,79 @@
+# Filtered Docker API proxy, for giving an automation account read-mostly
+# Docker access without giving it the host.
+#
+# Why: docker-group membership is root-equivalent. Anyone in that group can
+# run `docker run -v /:/host …` and walk out with the whole filesystem, so
+# "member of the docker group" is not a lesser privilege than root — it is
+# root with extra steps. This proxy exposes a regex-allowlisted subset of the
+# Docker API on 127.0.0.1:2375, which is what lets such an account be REMOVED
+# from the docker group and still do its steady-state work
+# (DOCKER_HOST=tcp://127.0.0.1:2375):
+#
+#   allowed: ping/version/info, container list/inspect, logs, events,
+#            exec into running containers (create/start/resize/inspect)
+#   blocked: container create/start/stop/remove, attach, images, networks,
+#            volumes, build, plugins, swarm — everything else (default deny)
+#
+# HONEST CEILING — read this before treating the proxy as a boundary. Exec is
+# not scoped per-container and cannot be with a path allowlist: the CLI
+# resolves a container *name* to an ID before it ever builds the request URL,
+# so by the time the proxy sees the path there is no name left to match on.
+# A name-based regex would therefore only constrain callers who volunteered
+# to use names. In practice a proxy client can get a root shell INSIDE any
+# RUNNING container — which, for any container running privileged, with added
+# capabilities, or in the host's network or PID namespace, is a short walk
+# back to the host. This is a real reduction from host root, not elimination.
+# Size the allowlist against what is actually running.
+#
+# Rare create/stop needs are meant to go through a separate, audited path
+# (an orchestrator UI, or a human) rather than by widening this allowlist.
+#
+# Loopback TCP means any LOCAL user on the host can reach the filtered API;
+# that is the accepted trade-off against unix-socket permission juggling. If
+# the host has untrusted local users, this is the wrong shape.
+#
+# Operate with:  docker compose up -d   (from this directory)
+#
+# Requires DOCKER_GID in the environment or a .env alongside this file —
+# see .env.example.
+services:
+  socket-proxy:
+    image: wollomatic/socket-proxy:1
+    container_name: docker-socket-proxy
+    restart: unless-stopped
+    # 65534 = nobody; DOCKER_GID = the host's docker group, so the bind-mounted
+    # socket is readable without running as root. Find it with:
+    #   getent group docker | cut -d: -f3
+    # It differs between distributions and between hosts — `:?` rather than a
+    # default, because a wrong gid fails as an unreadable socket at runtime.
+    user: "65534:${DOCKER_GID:?set DOCKER_GID — see .env.example}"
+    mem_limit: 64M
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges
+    ports:
+      - "127.0.0.1:2375:2375"
+    command:
+      - '-loglevel=info'
+      - '-listenip=0.0.0.0'
+      # Published on loopback only (ports: above); inside the compose
+      # network the source IP is the bridge gateway, so restrict by
+      # publish-binding rather than source address:
+      - '-allowfrom=0.0.0.0/0'
+      # Patterns are auto-anchored (^…$), Go regexp. API paths may arrive
+      # with or without the /v1.xx version prefix.
+      - '-allowHEAD=(/v1\..{1,2})?/_ping'
+      - '-allowGET=(/v1\..{1,2})?/(_ping|version|info|events.*)'
+      - '-allowGET=/v1\..{1,2}/containers/json.*'
+      - '-allowGET=/v1\..{1,2}/containers/[^/]+/json'
+      - '-allowGET=/v1\..{1,2}/containers/[^/]+/logs.*'
+      - '-allowGET=/v1\..{1,2}/exec/[^/]+/json'
+      - '-allowPOST=/v1\..{1,2}/containers/[^/]+/exec'
+      - '-allowPOST=/v1\..{1,2}/exec/[^/]+/(start|resize)'
+      - '-watchdoginterval=3600'
+      - '-stoponwatchdog'
+      - '-shutdowngracetime=5'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro

@@ -1,0 +1,19 @@
+[Unit]
+Description=media-stack: check qbittorrent/prowlarr/sonarr/radarr netns against media-vpn
+Documentation=file:///opt/media-stack/netns-guard.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/media-stack/netns-guard.sh
+# Root: talks to the local Docker socket directly to inspect/restart
+# containers. That socket is root-equivalent on the host, so a root systemd
+# unit using it per run adds no privilege root did not already have --
+# which is the whole reason this is a host-side script and timer rather
+# than a long-lived container holding the socket. See README.md.
+User=root
+
+# Installed by install-on-host.sh to /etc/systemd/system/ -- the copy in
+# this repo is the source of truth; edit here and re-run install-on-host.sh
+# to push a change, don't hand-edit the installed copy.

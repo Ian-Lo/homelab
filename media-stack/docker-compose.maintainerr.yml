@@ -1,0 +1,167 @@
+# Portainer stack: Maintainerr (library retention rules).
+#
+# Deploy as a git-repository stack with compose path:
+#   media-stack/docker-compose.maintainerr.yml
+#
+# Deliberately a THIRD, separate stack. Maintainerr never touches VPN egress
+# (it only calls Sonarr's HTTP API), so it has no reason to share the vpn
+# netns; and it is capable of DELETING LIBRARY FILES on a schedule, which
+# is exactly the blast radius that argues for keeping it independently
+# stoppable without that being coupled to redeploying Jellyfin's serving
+# stack or the tunnel.
+#
+# Maintainerr stays OUTSIDE the PIA tunnel for the same reason Jellyfin
+# does: no privacy-sensitive egress (it talks to Sonarr on the internal
+# link network, plus its own update checks).
+#
+# IMAGE PATH: use the ORG path ghcr.io/maintainerr/maintainerr, NOT
+# ghcr.io/jorenn92/maintainerr. The personal path is abandoned; a lot of
+# guides still name it. Both were resolved and compared directly from their
+# registry config blobs:
+#
+#   ghcr.io/jorenn92/maintainerr:latest    created 2025-08-17, Node 20.18.1,
+#                                          VERSION_TAG=stable, NO healthcheck
+#   ghcr.io/maintainerr/maintainerr:latest created 2026-08-21, Node 26.3.0,
+#                                          VERSION_TAG=latest, healthcheck present
+#
+# The personal path is over a year stale -- pinning it would have deployed a
+# year-old build, missing a year of fixes, to hold unscoped *arr API keys.
+# Bump along the org path from here.
+#
+# Digest pinning: upstream publishes a floating `latest`, so there is
+# nothing stable to pin but a content digest. The digest below is the
+# manifest-LIST digest for `latest` on the org path, resolved 2026-08-25 via
+# ghcr.io's token + manifest API and confirmed to include a linux/amd64
+# entry (amd64 child manifest
+# sha256:ae50e7bcf3947857d7afc19f0395e81c8571146002eac18686520858bc919922).
+# Re-resolve and bump deliberately -- see docker-compose.vpn.yml's header
+# for the full rationale, which applies identically here.
+#
+# Image config verified at the same time (registry config blob):
+# Volumes {/opt/data}, ExposedPorts {6246/tcp}, DATA_DIR=/opt/data,
+# UI_PORT=6246, default user `node` (uid 1000 in the node base image, so
+# the explicit 1000:1000 below matches rather than fights it).
+#
+# Optional stack environment variables:
+#   TZ           IANA timezone (default Etc/UTC)
+#
+# No MEDIA_ROOT bind here, ON PURPOSE. Maintainerr does not need to see the
+# media tree to do its job: it asks Sonarr to delete, and Sonarr owns the
+# files. Giving this container a writable library mount would hand a
+# rules-engine direct filesystem reach over the library — strictly more
+# blast radius than the feature requires. If a future rule genuinely needs
+# it, that is a decision to make explicitly, not a mount to add quietly.
+
+services:
+  maintainerr:
+    # ghcr.io/maintainerr/maintainerr, tag `latest`. Digest resolved
+    # 2026-08-25 (linux/amd64 present in the manifest list).
+    image: ghcr.io/maintainerr/maintainerr@sha256:2ac67f176a77f1e78d66b24c1b0d108c587abe1063f46ce75cfaa4cd06516a80
+    container_name: maintainerr
+    restart: unless-stopped
+    # PID 1 reaping. The image's entrypoint is a Node start.sh, which has the
+    # same non-reaping property that, in another stack, left over a hundred
+    # zombie browser processes parented to a `tail -F` PID 1. Whether this
+    # app ever fans out enough to matter is unknown, which is the argument
+    # for a one-line prophylactic rather than against it.
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL      # node process on a high port, no binds, no privileged work
+    # Bounded like byparr so a runaway rule evaluation cannot starve the
+    # host. Values are a starting point, not measured -- revisit if the
+    # container gets OOM-killed during a large library scan.
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      # Runs the image's OWN healthcheck script rather than a curl one-liner.
+      # Deliberate: the org image declares HEALTHCHECK /opt/app/healthcheck.sh,
+      # and a hand-rolled `curl` probe would assume a binary that may not be
+      # in a Node image at all (the previously-planned jorenn92 image shipped
+      # no healthcheck, so there was nothing to confirm curl against).
+      # Invoking the shipped script assumes nothing.
+      test: ["CMD", "/opt/app/healthcheck.sh"]
+      interval: 5m
+      timeout: 30s
+      retries: 3
+      start_period: 60s
+    # Matches the image's own `node` user and the host media user, so the
+    # named volume's contents stay readable/writable without a root step.
+    user: "1000:1000"
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+    # LOOPBACK ONLY, not the LAN address. Maintainerr appears to have NO
+    # authentication of its own (the README and 30 releases at time of
+    # checking mention auth only in the sense of authenticating OUTBOUND to
+    # Plex/Emby; no sign of a login for its own UI), and it holds full
+    # Sonarr/Radarr API keys -- the *arrs have no scoped keys -- behind a
+    # rules engine whose whole purpose is deleting media. Publishing that to
+    # the LAN would put an unauthenticated delete-capable control plane in
+    # front of every device on the network.
+    #
+    # This follows the precedent already set by byparr in
+    # docker-compose.vpn.yml, which binds HOST: 127.0.0.1 for exactly this
+    # reason (its own unauthenticated endpoint).
+    #
+    # Reach the UI with an SSH tunnel:
+    #     ssh -N -L 6246:127.0.0.1:6246 <user>@<host>
+    #     then open http://127.0.0.1:6246
+    #
+    # Putting it directly on the LAN means "${LAN_IP}:6246:6246" -- a
+    # deliberate exposure decision, never a default.
+    ports:
+      - "127.0.0.1:6246:6246"
+    networks:
+      # Mapping form for consistency with the other stacks. `default` MUST
+      # stay listed -- naming any network opts this service out of the
+      # implicit default, and Maintainerr needs ordinary egress for its own
+      # update checks.
+      default: {}
+      # Sonarr is reachable here as `media-vpn:8989`. Sonarr shares the vpn
+      # container's whole network stack (network_mode: service:vpn), so it
+      # is present on every network `vpn` is attached to, media-jf-link
+      # included. Do NOT point Maintainerr at the LAN-published 8989 -- the
+      # DOCKER-USER rules drop container->LAN-published-port hairpin
+      # traffic, which is the same reason the *arrs and Jellyfin already
+      # talk over this link network.
+      #
+      # UNVERIFIED UNTIL FIRST DEPLOY: that Docker's embedded DNS resolves
+      # `media-vpn` from this side. The reasoning is that the broken-DNS
+      # caveat in this repo applies only INSIDE the vpn netns (wg-quick
+      # rewrites its resolv.conf to PIA's resolvers), not to outside
+      # containers looking in -- but that has not been demonstrated yet.
+      # Maintainerr's own Sonarr connection test is the check; if it fails,
+      # fall back to the vpn container's media-jf-link address rather than
+      # to the published LAN port -- the DOCKER-USER hairpin drop makes the
+      # LAN port a dead end for a container source.
+      #
+      # On that fallback address: media-vpn is pinned to 10.89.0.2 in
+      # mapping form for exactly this reason. As a list-form attachment it
+      # was a dynamic lease that merely happened to be the lowest free
+      # address, and creating THIS stack -- a new container on that network
+      # -- is precisely the event most likely to take it. The pin must be
+      # live (vpn stack redeployed) BEFORE this stack is created; deploy in
+      # that order.
+      #
+      # Prefer the DNS name anyway. It stays correct if the addressing ever
+      # changes again, and it is what Maintainerr's Sonarr connection should
+      # be configured with; 10.89.0.2 is the fallback for diagnosis, not the
+      # value to type into the UI.
+      media-jf-link: {}
+    volumes:
+      - maintainerr-data:/opt/data
+
+networks:
+  # See docker-compose.vpn.yml's identical block for the full rationale.
+  # External + created by install-on-host.sh because this network spans
+  # Portainer stacks; `internal: true` at creation is what makes it
+  # structurally incapable of carrying egress.
+  media-jf-link:
+    external: true
+
+volumes:
+  # Named volume under /var/lib/docker -- not on MEDIA_ROOT, not covered by
+  # any backup job by default. Losing it costs re-adding the Sonarr
+  # connection and re-creating the rule, not any media.
+  maintainerr-data:

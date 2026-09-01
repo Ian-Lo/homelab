@@ -1,0 +1,61 @@
+# Portainer CE server.
+#
+# This is the Portainer that manages everything else, including remote Docker
+# hosts reached over the direct Docker API on 2376 with mTLS. Its datastore
+# therefore holds client keys that are root-equivalent on those hosts.
+#
+# Deploy this with `docker compose` from the CLI, NOT as a Portainer-managed
+# stack. Portainer cannot reliably redeploy a stack that contains its own
+# container: the compose process runs *inside* the Portainer container, so
+# removing that container kills the process doing the removing, and the stack
+# is left half-applied with no UI to fix it from. See README.md.
+#
+#   docker compose up -d          # deploy / upgrade
+#   docker compose pull           # fetch a newer pinned tag first
+#
+# The datastore lives in the EXTERNAL volume `portainer_data`. If you are
+# adopting an existing hand-run Portainer container, `external: true` is what
+# stops compose from creating a fresh, empty `portainer_portainer_data` volume
+# instead and silently orphaning every environment, stack and credential —
+# they stay on disk, just no longer attached, and you get a "create an admin
+# account" screen as your only warning.
+
+services:
+  portainer:
+    # Pinned deliberately — `:lts` would make any redeploy an unreviewed
+    # version jump, and the datastore migration is one-way. Bump this
+    # explicitly, after reading the release notes, with a backup in hand.
+    image: portainer/portainer-ce:2.39.7
+    container_name: portainer
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      # HTTPS UI, loopback only. Do NOT restore the all-interfaces line below
+      # without a reason: this volume holds /var/run/docker.sock (root on the
+      # machine Portainer runs on) and the mTLS client certs for every remote
+      # environment (root-equivalent there), all behind a Community Edition
+      # login with no MFA.
+      #
+      # THIS LINE ASSUMES PORTAINER RUNS ON THE MACHINE YOU BROWSE FROM.
+      # If you redeploy Portainer on a different host, 127.0.0.1 makes the UI
+      # unreachable and the reflex fix is to switch back to "9443:9443" --
+      # which silently restores LAN exposure. On a remote host, tunnel
+      # instead:
+      #     ssh -N -L 9443:127.0.0.1:9443 <user>@<host>
+      # or put an authenticating reverse proxy in front. See README.md.
+      - "127.0.0.1:9443:9443"
+      # - "9443:9443"
+      #
+      # Edge agent tunnel. Deliberately NOT published — nothing needs it
+      # unless you actually run an Edge agent. Uncomment only if you do.
+      # - "8000:8000"
+    volumes:
+      # Root-equivalent on this machine. Unavoidable for Portainer to manage
+      # the local environment; it is also why the UI port placement matters.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+volumes:
+  portainer_data:
+    external: true

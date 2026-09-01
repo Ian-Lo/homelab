@@ -1,0 +1,439 @@
+# Portainer stack: PIA WireGuard tunnel + qBittorrent + Prowlarr/Sonarr/Radarr.
+#
+# Deploy as a git-repository stack with compose path:
+#   media-stack/docker-compose.vpn.yml
+#
+# Bring this up in two steps the first time, gated by
+# Compose PROFILES rather than per-service scaling — a Portainer Repository
+# stack on a standalone (non-Swarm) endpoint always deploys every service in
+# the file, so scaling a service to 0 replicas or running
+# `docker compose up -d vpn` by hand is not actually available here (the
+# latter would also collide with Portainer's own deploy on
+# `container_name: media-vpn`, and `${MEDIA_ROOT:?...}` would abort at
+# parse time unless exported first). Instead:
+#   1. First deploy: leave the stack variable `COMPOSE_PROFILES` UNSET.
+#      qbittorrent/prowlarr/sonarr/radarr all carry `profiles: ["apps"]`
+#      below, so with no profile active only `vpn` starts. Verify the tunnel
+#      -- egress IP, DNS, kill switch -- before anything else touches it.
+#   2. Once those are green: set the stack variable `COMPOSE_PROFILES=apps`
+#      and redeploy. `depends_on: ... : service_healthy` then brings up
+#      qbittorrent/prowlarr/sonarr/radarr only once the vpn container's own
+#      healthcheck passes. This redeploy is also the window for the
+#      qBittorrent WebUI password bootstrap — see scripts/qbt-portsync.sh's
+#      header for why that ordering is load-bearing.
+# Verify either shape locally with:
+#   docker compose -f docker-compose.vpn.yml config --services
+#   COMPOSE_PROFILES=apps docker compose -f docker-compose.vpn.yml config --services
+#
+# IMPORTANT — the namespace lifecycle trap (see DESIGN.md):
+# qbittorrent/prowlarr/sonarr/radarr
+# all run inside `vpn`'s network namespace via network_mode: service:vpn.
+# If `vpn`'s namespace is destroyed (stopped, or recreated with a new
+# container ID) the four dependants keep running but lose all networking.
+# ALWAYS REDEPLOY THE STACK; NEVER `docker restart media-vpn` ON ITS OWN.
+# scripts/netns-guard.sh + the systemd timer catch and alert on drift, but
+# they are a safety net, not a substitute for the right redeploy habit.
+#
+# Digest pinning: linuxserver.io and thrnz publish no per-version tags for
+# these images (only floating `latest`), so there is nothing stable to pin
+# other than a content digest. Each digest below is the manifest-LIST
+# digest for the `latest` tag, resolved 2026-08-22 via the public registry
+# HTTP APIs (Docker Hub / lscr.io->ghcr.io token + manifest GET) and
+# confirmed to include a linux/amd64 entry. Pinning the list digest
+# (not a single-platform manifest
+# digest) keeps the reference portable and lets Docker resolve the right
+# platform itself — the actual, wanted behaviour here. Re-resolve and bump
+# deliberately; a floating tag would turn every unrelated redeploy into an
+# unreviewed version jump.
+#
+# Required stack environment variables:
+#   MEDIA_ROOT   host directory that is the single parent of downloads AND
+#                library — see README.md "Storage" for why this must be one
+#                filesystem (hardlinks).
+#   BYPARR_OWUI_KEY  random secret (e.g. `openssl rand -hex 32`) closing
+#                Byparr's otherwise-unauthenticated /load endpoint — an
+#                SSRF primitive that drives the browser to arbitrary URLs
+#                and returns the page text.
+#                Prowlarr never uses /load, so nothing else needs this
+#                value; set it once and forget it. Like
+#                MEDIA_ROOT, the `:?` guard aborts at PARSE time — the
+#                variable must be set on the stack before ANY redeploy,
+#                even a Phase-1 (no-profile) one. Fail-closed on purpose:
+#                an empty key would silently reopen the /load hole.
+# Optional:
+#   TZ           IANA timezone (default Etc/UTC)
+#   PIA_LOC      PIA region id. REQUIRED, no default: it MUST be a
+#                port-forwarding-capable region, and which ones qualify
+#                changes over time (no US region does, at time of writing).
+#                Consult PIA's current region list. A wrong id does NOT
+#                error -- the container connects happily and port forwarding
+#                simply never arrives, so grep the log to confirm rather
+#                than assuming.
+#
+# Host-side prerequisites (installed by install-on-host.sh — see README.md;
+# NOT done by this compose file):
+#   /root/pia-user, /root/pia-pass, /root/qbt-pass   mode 400, root:root
+#   /opt/media-stack/vpn/qbt-portsync.sh             mode 755, root:root
+#                                                     (its OWN directory,
+#                                                     mounted below, not
+#                                                     bind-mounted as a
+#                                                     single file — see the
+#                                                     comment on the mount)
+#   /opt/media-stack/netns-guard.sh                  mode 755, root:root
+#                                                     (host-only — run by
+#                                                     systemd, never mounted
+#                                                     into a container)
+#   wireguard.ko preloaded via /etc/modules-load.d/
+#   DOCKER-USER iptables rules restricting the published ports to the LAN
+
+services:
+  vpn:
+    # thrnz/docker-wireguard-pia, Docker Hub, tag `latest` — no per-version
+    # tags published upstream. Digest resolved 2026-08-22 (linux/amd64
+    # present in the manifest list).
+    image: thrnz/docker-wireguard-pia@sha256:a63228ca35b55aeafeedfda33004e482c14672c79171c96942048ea37da08b02
+    container_name: media-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN            # NOT SYS_MODULE -- wireguard.ko is preloaded on
+                              # the host by install-on-host.sh; this container
+                              # never needs host-root-equivalent capability
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: 1   # namespaced to this container;
+                                             # the host's own default sysctl
+                                             # is left at 0
+    environment:
+      LOC: ${PIA_LOC:?PIA region id -- must be port-forwarding-capable}
+      USER_FILE: /pia-user
+      PASS_FILE: /pia-pass
+      # Check your ACTUAL netmask rather than assuming /24 -- if the LAN is
+      # wider than what you put here, some clients silently cannot reach the
+      # WebUIs, and the symptom looks like an application fault.
+      #
+      # This is needed so WebUI replies and Jellyfin notifications reach LAN
+      # clients through the kill switch -- but it IS a LAN-wide hole in that
+      # kill switch, and it should be understood as an accepted risk rather
+      # than a setting. See README.md "Known risks".
+      LOCAL_NETWORK: ${LAN_SUBNET:?LAN subnet in CIDR, e.g. 192.168.1.0/24}
+      PORT_FORWARDING: 1
+      PORT_PERSIST: 1        # keep the same forwarded port across restarts
+                              # (survives ~2 months on the same PF token)
+      FIREWALL: 1             # default-DROP kill switch -- the layer that
+                               # matters when the container is up but the
+                               # tunnel itself is down (test C2)
+      EXIT_ON_FATAL: 1        # die loudly rather than sit "connected" with
+                               # no working tunnel
+      ACTIVE_HEALTHCHECKS: 1  # the image's healthcheck
+                               # defaults to PASSIVE (`wg show wg0` + `pidof
+                               # pf.sh`), which pass whenever the wg0
+                               # INTERFACE merely exists -- so a silently dead
+                               # tunnel (blackholed endpoint, stale handshake)
+                               # sat `Up (healthy)` for 6 min with egress 000
+                               # and EXIT_ON_FATAL never fired (it covers
+                               # auth/startup fatals, not a dead-but-up
+                               # tunnel). =1 makes the check ping THROUGH wg0
+                               # (`ping -I wg0`), so Docker marks the container
+                               # `unhealthy` in ~3 min (3 retries x 60s) when
+                               # no traffic flows. Cost: one ping/min (why
+                               # upstream defaults it off). Docker does NOT act
+                               # on `unhealthy` and `restart: unless-stopped`
+                               # ignores health -- netns-guard.sh is the actor
+                               # that closes the loop (alerts; opt-in restart).
+      # These two pins keep the active check inside Docker's healthcheck
+      # Timeout, which the image sets to 3s. The script's defaults run up
+      # to TWO `timeout 3 ping` attempts (www.privateinternetaccess.com,
+      # then 1.1.1.1) -- worst case 6s+ against the 3s cap, and the first
+      # target needs DNS *through the tunnel*. A merely DEGRADED tunnel
+      # (slow, or DNS-impaired) would therefore be killed at 3s and counted
+      # a failure; three such cycles marks the container unhealthy for the
+      # wrong reason, and if RESTART_VPN_ON_UNHEALTHY=1 is ever set on the
+      # guard that becomes a spurious restart storm -- the exact I1 strand
+      # the I6 work exists to prevent. One 2s ping to a fixed IP is a clean
+      # liveness signal with no DNS dependency and headroom inside the cap.
+      # Trade-off accepted: drops the dual-target robustness of the default.
+      HEALTHCHECK_PING_TARGET: 1.1.1.1
+      HEALTHCHECK_PING_TIMEOUT: 2
+      PORT_SCRIPT: /opt/media-stack/vpn/qbt-portsync.sh
+      QBT_PASSWORD_FILE: /qbt-pass
+      # Explicit, not left to qbt-portsync.sh's own default, so this and
+      # qbittorrent's WEBUI_PORT below can't silently drift apart.
+      QBT_HOST: 127.0.0.1:8080
+      TZ: ${TZ:-Etc/UTC}
+    volumes:
+      - /root/pia-user:/pia-user:ro
+      - /root/pia-pass:/pia-pass:ro
+      - /root/qbt-pass:/qbt-pass:ro
+      # A DIRECTORY mount, not a single-file bind mount -- this one is
+      # subtle and bites on the SECOND install, not the first.
+      # `install(1)` unlinks-then-creates on every re-run
+      # of install-on-host.sh, so a single-file bind would keep this
+      # already-running container's view pinned to the OLD inode — silently
+      # contradicting "safe to re-run ... refreshes the scripts." A missing
+      # file at first deploy would also make Docker create a DIRECTORY at
+      # that host path, breaking the next install-on-host.sh run outright
+      # ("cannot overwrite directory"). Mounting qbt-portsync.sh's own
+      # directory instead is inode-stable across reinstalls AND still
+      # narrow: netns-guard.sh (host-only, run by systemd, never inside a
+      # container) lives in the PARENT /opt/media-stack/, one level
+      # up, so it is never reachable from this root + NET_ADMIN container.
+      - /opt/media-stack/vpn:/opt/media-stack/vpn:ro
+      - pia-shared:/pia-shared
+    ports:                    # bound to the host's LAN address, never bare
+                               # 0.0.0.0 -- the namespace owner owns every
+                               # published port; the four dependants publish
+                               # nothing of their own
+      - "${LAN_IP:?host LAN address to publish on}:8080:8080"   # qBittorrent
+      - "${LAN_IP:?}:9696:9696"   # Prowlarr
+      - "${LAN_IP:?}:8989:8989"   # Sonarr
+      - "${LAN_IP:?}:7878:7878"   # Radarr
+    networks:
+      # `default` MUST stay listed. Naming any network here opts the service
+      # out of the implicit default, and `default` is this container's only
+      # route to the internet -- without it wg0 can never reach the PIA
+      # endpoint and the whole stack is dead. media-jf-link is `internal`
+      # and deliberately carries no default route (see below).
+      #
+      # Mapping form, not a list: media-jf-link needs a per-network key
+      # (ipv4_address) and YAML forbids mixing `- item` with `key:` in one
+      # block. `default: {}` is the mapping-form equivalent of listing it.
+      default: {}
+      # Reaches Jellyfin without the *arrs hairpinning through the
+      # LAN-published 8096, which DOCKER-USER drops for container sources.
+      # The four dependants share this
+      # container's netns, so attaching it here is what gives THEM the path.
+      # Must be attached at container START: thrnz's FIREWALL=1 enumerates
+      # attached docker networks when it builds the kill switch, so a hot
+      # `docker network connect` would not be reflected in the rules.
+      media-jf-link:
+        # PINNED. As a list-form attachment this was
+        # a dynamic lease that merely happened to be the
+        # lowest free address -- while Jellyfin next door pins
+        # 10.89.0.10 in mapping form. Anything holding the literal .2 was
+        # therefore one container-creation or recreate-ordering change away
+        # from silently pointing at the wrong backend, and the usual escape
+        # hatch is closed here: service-name DNS does not resolve from
+        # inside this netns, because wg-quick rewrites /etc/resolv.conf to
+        # the VPN's resolvers. That is the trap worth remembering: inside a
+        # netns owned by a VPN container, Docker's service-name DNS is gone,
+        # so pin the address in IPAM rather than relying on a name.
+        #
+        # The trigger that forced this: adding a THIRD stack
+        # (docker-compose.maintainerr.yml) puts a new container on this
+        # network, and a new container is exactly the event that can take
+        # .2 -- if it starts while vpn is down (host reboot, stack ordering)
+        # it wins the address and vpn lands on .3. Pin before that stack is
+        # created, not after.
+        ipv4_address: 10.89.0.2
+
+  qbittorrent:
+    # lscr.io/linuxserver/qbittorrent, tag `latest`. Digest resolved
+    # 2026-08-22 via lscr.io's ghcr.io-backed registry (linux/amd64 present).
+    image: lscr.io/linuxserver/qbittorrent@sha256:212b86dff59e3962b4082b5ef20a577e76c8f8527d2ab505cfa887b4bcecb0b0
+    container_name: qbittorrent
+    restart: unless-stopped
+    profiles: ["apps"]   # B1: absent by default so a first deploy with no
+                          # COMPOSE_PROFILES starts only `vpn` (Phase 1);
+                          # set COMPOSE_PROFILES=apps and redeploy for
+                          # Phase 2 — see the file header comment
+    security_opt:
+      - no-new-privileges:true
+    network_mode: "service:vpn"    # the kill switch: owns no interface of
+                                    # its own, so if `vpn`'s namespace goes,
+                                    # there is nothing to leak through
+    depends_on:
+      vpn:
+        condition: service_healthy
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ:-Etc/UTC}
+      # 002, not the image default 022: imports must land group-writable so
+      # the host user and the *arrs can both manage them -- at the default
+      # 022 they arrive 644 and the host user cannot. Files become 664 and
+      # directories 775. Only takes
+      # effect on container RECREATION, not restart.
+      UMASK: "002"
+      WEBUI_PORT: 8080
+    volumes:
+      - qbittorrent-config:/config
+      - ${MEDIA_ROOT:?media parent directory on the host -- see .env.example}:/data
+
+  prowlarr:
+    # lscr.io/linuxserver/prowlarr, tag `latest`. Digest resolved 2026-08-22.
+    image: lscr.io/linuxserver/prowlarr@sha256:1295cff29d10b486c0d8324d1559a552140a5932bf8b3d87e398654414f63f92
+    container_name: prowlarr
+    restart: unless-stopped
+    profiles: ["apps"]   # see qbittorrent's profiles: comment above
+    security_opt:
+      - no-new-privileges:true
+    network_mode: "service:vpn"
+    depends_on:
+      vpn:
+        condition: service_healthy
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ:-Etc/UTC}
+    volumes:
+      - prowlarr-config:/config
+      - ${MEDIA_ROOT:?media parent directory on the host -- see .env.example}:/data
+
+  sonarr:
+    # lscr.io/linuxserver/sonarr, tag `latest`. Digest resolved 2026-08-22.
+    image: lscr.io/linuxserver/sonarr@sha256:c19aa4ecdf03d73e1d5c901da33744cb7eb4d921f89bafed1ca264601d7fa224
+    container_name: sonarr
+    restart: unless-stopped
+    profiles: ["apps"]   # see qbittorrent's profiles: comment above
+    security_opt:
+      - no-new-privileges:true
+    network_mode: "service:vpn"
+    depends_on:
+      vpn:
+        condition: service_healthy
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ:-Etc/UTC}
+      UMASK: "002"          # see qbittorrent above (664/775, not 644)
+    volumes:
+      - sonarr-config:/config
+      - ${MEDIA_ROOT:?media parent directory on the host -- see .env.example}:/data
+
+  radarr:
+    # lscr.io/linuxserver/radarr, tag `latest`. Digest resolved 2026-08-22.
+    image: lscr.io/linuxserver/radarr@sha256:a45b5ab0f850f39edb4cc9c95bbd967b52ddc3d4574a4dfb45561177db6c88f4
+    container_name: radarr
+    restart: unless-stopped
+    profiles: ["apps"]   # see qbittorrent's profiles: comment above
+    security_opt:
+      - no-new-privileges:true
+    network_mode: "service:vpn"
+    depends_on:
+      vpn:
+        condition: service_healthy
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TZ:-Etc/UTC}
+      UMASK: "002"          # see qbittorrent above (664/775, not 644)
+    volumes:
+      - radarr-config:/config
+      - ${MEDIA_ROOT:?media parent directory on the host -- see .env.example}:/data
+
+  byparr:
+    # Cloudflare challenge solver for Prowlarr.
+    # ghcr.io/thephaseless/byparr, version 3.0.4 (== the
+    # `latest` manifest at pin time). Manifest-LIST digest resolved
+    # 2026-08-23 via ghcr.io token + manifest GET; linux/amd64 present.
+    # Image is cosign-signed (.sig tags on ghcr.io) — run `cosign verify`
+    # as part of the deliberate-bump ritual.
+    image: ghcr.io/thephaseless/byparr@sha256:874f719518f617d03a60e03411fc5d090647e1a877041e81f8dc965927c7deb6
+    container_name: byparr
+    restart: unless-stopped
+    profiles: ["apps"]   # see qbittorrent's profiles: comment above
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL      # runs as UID 1000 on a high port with no volumes — needs
+                  # not one of Docker's default caps, and its whole job is
+                  # rendering hostile web content (review S3)
+    network_mode: "service:vpn"    # solve challenges on the SAME egress IP
+                                    # Prowlarr uses -- Cloudflare binds its
+                                    # clearance to the exit IP, so a solver
+                                    # anywhere else earns useless cookies.
+                                    # Inherits the kill switch like every
+                                    # other dependant; MUST also be listed
+                                    # in netns-guard.sh DEPENDANTS (it is)
+    depends_on:
+      vpn:
+        condition: service_healthy
+    # Byparr reads UNPREFIXED env vars (pydantic-settings, no env_prefix):
+    # VERSION, LOG_LEVEL, PORT, PROXY_* etc. all silently reconfigure it.
+    # Never put a shared or generically-named variable on this service.
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      # Loopback of the SHARED netns only, and deliberately NOT in vpn's
+      # ports: list — Prowlarr at 127.0.0.1:8191 is the only reachable
+      # client. This bind is the ONLY inbound control here:
+      # if br_netfilter is not loaded and this regresses to the 0.0.0.0
+      # default, Byparr is reachable from Jellyfin over media-jf-link and
+      # no firewall rule can intervene. Assert 127.0.0.1:8191 after every
+      # recreation — this one is worth making deploy-blocking.
+      HOST: 127.0.0.1
+      PORT: "8191"
+      # Closes the unauthenticated /load SSRF surface — see the header's
+      # BYPARR_OWUI_KEY note. The only control that still
+      # holds if the HOST bind ever regresses.
+      OWUI_API_KEY: ${BYPARR_OWUI_KEY:?random secret, e.g. openssl rand -hex 32 -- closes Byparr's unauthenticated /load endpoint}
+      # Don't fetch images/media while solving: less hostile content
+      # rendered, less tunnel bandwidth. Verify your indexers still solve
+      # with this on; drop it if not.
+      BLOCK_MEDIA: "true"
+    # Camoufox (headless Firefox) multiprocessing breaks against Docker's
+    # default 64MB /dev/shm; 512mb is the project's own recommendation.
+    # NOTE: on cgroup v2, tmpfs pages — /dev/shm included — are charged
+    # against THIS container's memory limit. The browser's real budget is
+    # mem_limit minus whatever /dev/shm holds, which is why the limit below
+    # is 1.5g and not 1g. Record `df -h /dev/shm` alongside `docker stats`
+    # when you tune it: an shm-driven OOM never shows up in stats and is
+    # close to undiagnosable without it.
+    shm_size: 512mb
+    # Hard ceiling with NO swap headroom beyond it (memswap == mem), and
+    # that equality is the point. An unbounded headless browser on a host
+    # under memory pressure invites the kernel OOM killer to choose the
+    # victim, and it will not choose the browser. A container dying under
+    # its own limit is loud and self-contained; the OOM killer taking the
+    # VPN container instead strands every dependant in this namespace.
+    # 1.5g leaves ~1g for the browser after the /dev/shm charge above.
+    mem_limit: 1.5g
+    memswap_limit: 1.5g
+    # Override the image's own healthcheck: upstream's /health performs a
+    # REAL browser navigation to google.com every 15 min — ~96 unrequested
+    # hits/day on the PIA exit, and a 30s timeout a cold browser launch
+    # can miss under memory pressure (review S1). /docs is a plain HTTP
+    # liveness signal from the same FastAPI process.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -o /dev/null http://127.0.0.1:8191/docs || exit 1"]
+      interval: 5m
+      # 30s, not 10s (post-deploy audit P3): /docs is served by the same
+      # asyncio loop that drives the browser, and real solves run >13s —
+      # a probe landing mid-solve would be recorded as a failure for
+      # being BUSY, a milder return of the S1 failure mode this override
+      # exists to remove. Free, given the 5m interval.
+      timeout: 30s
+      retries: 3
+      # Without this, the first probe fires ~5s after start — before
+      # uvicorn listens — logging a guaranteed spurious failure on every
+      # recreation, in exactly the log someone reads during an incident
+      # (post-deploy audit P2).
+      start_period: 60s
+    # No volumes, deliberately: Camoufox is baked into the image at build
+    # time and Byparr holds no state worth keeping — a recreation costs
+    # nothing but re-solving the next challenge. No PUID/PGID/UMASK
+    # either; it touches no media files.
+
+networks:
+  # Cross-stack link to Jellyfin. Declared `external` in BOTH compose files
+  # because it spans two Portainer stacks and neither may own its lifecycle;
+  # install-on-host.sh creates it idempotently, before either stack deploys.
+  #
+  # It is created `--internal` with subnet 10.89.0.0/24. `internal` is the
+  # load-bearing security property: Docker adds no masquerade and no gateway
+  # for it, so this link can never become an egress path and the
+  # "all app egress goes through the VPN" rule holds BY CONSTRUCTION rather
+  # than by firewall rule. 10.89.0.0/24 sits outside Docker's default
+  # address pool (172.16.0.0/12) so it can never collide with an
+  # auto-allocated network.
+  media-jf-link:
+    external: true
+
+volumes:
+  # Named volumes under /var/lib/docker -- NOT on MEDIA_ROOT, and not
+  # covered by any backup job by default (see README.md "Storage").
+  # Losing one costs hours of reconfiguration, not data; revisit once a
+  # backup story for these exists.
+  pia-shared:
+  qbittorrent-config:
+  prowlarr-config:
+  sonarr-config:
+  radarr-config:
